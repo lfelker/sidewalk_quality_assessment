@@ -24,17 +24,15 @@ def main():
 	click.echo("Loading Data")
 
 	streets = gpd.read_file('./data/sdot/streets.shp').to_crs(crs_utm)
+	# print(streets.head())
 
 	# Get the neighborhoods
 	neighborhoods = gpd.read_file('./data/neighborhoods/Neighborhoods.shp')
-	# Reproject to common projection
 	neighborhoods = neighborhoods.to_crs(crs_utm)
-
 	neighborhood_name = 'University District'
 	neighborhood_escname = neighborhood_name.replace(' ', '_')
 	mask = neighborhoods['S_HOOD'] == neighborhood_name
 	udistrict = neighborhoods.loc[mask, 'geometry'].iloc[0]
-
 
 	click.echo("Preparing SDOT Data")
 	sdot_json = open("./data/sdot/SDOT_swk.json").read()
@@ -45,25 +43,24 @@ def main():
 	sdot_gdf.crs = crs_merc
 	sdot_gdf = sdot_gdf.to_crs(crs_utm)
 	sdot_gdf = clip_data(sdot_gdf, udistrict)
-	print(sdot_gdf.head())
+	# print(sdot_gdf.head())
 	# plot_buffer(sdot_gdf, udistrict)
 
 	click.echo("Preparing Access Map Data")
 	am_gdf = json_to_gdf("./data/access_map/sidewalks.geojson")
 	am_gdf = clip_data(am_gdf, udistrict)
-	print(am_gdf.head())
+	# print(am_gdf.head())
 	# plot_buffer(am_gdf, udistrict)
-	# TODO: generate access map data with SDOT id
 
 	click.echo("Preparing OSM Data")
 	osm_gdf = json_to_gdf("./data/osm/udistrict_sidewalks.geojson")
-	print(osm_gdf.head())
-	#plot_buffer(osm_gdf, udistrict)
+	# print(osm_gdf.head())
+	# plot_buffer(osm_gdf, udistrict)
 
 	click.echo("Polyganizing Blocks")
 	blocks = blocks_subtasks(streets)
 	blocks = filter_blocks_by_poly(blocks, udistrict)
-	#visualize(blocks)
+	# visualize(blocks)
 
 	layers = {
 		'osm_gdf': osm_gdf,
@@ -77,57 +74,122 @@ def main():
 		if len(osm_gdf) > 0:
 			# only examine blocks that have osm data
 
-			# Create OSM graph first
+			# Create OSM Graph
+			osm_gdf['slope'] = osm_gdf['geometry'].apply(slope)
+			sdot_gdf = blocks_gdfs[block_num]['sdot_gdf']
+			sdot_gdf['slope'] = sdot_gdf['geometry'].apply(slope)
+
+			# Find One to One comparison
+			for osm_row in osm_gdf.iterrows():
+				if type(osm_row[1]['geometry']) == shapely.geometry.LineString:
+					print("NEW GEO COMP")
+					print(osm_row)
+					target_gdf = gpd.GeoDataFrame(geometry=[osm_row[1]['geometry']])
+					matches = []
+					for sdot_row in sdot_gdf.iterrows():
+						close_end = compare_ends(osm_row, sdot_row)
+						close_slope = compare_slopes(osm_row, sdot_row)
+						close_length = compare_lengths(osm_row, sdot_row)
+						if close_end and close_slope and close_length:
+							print("MATCH")
+							matches.append(sdot_row[1]['geometry'])
+					matches_gdf = gpd.GeoDataFrame(geometry=matches)
+					if len(matches) > 0:
+						visualize(target_gdf, buff=blocks_gdfs[block_num]['polygon'], title="Matches Found: " + str(len(matches)), extras=[matches_gdf])
+					else:
+						visualize(target_gdf, buff=blocks_gdfs[block_num]['polygon'], title="Matches Found: " + str(len(matches)), extras=[sdot_gdf])
+
+
+
+
+
+			# for row in osm_gdf:
+				# geo = osm_gdf['geometry']
+				# if type(geo) == shapely.geometry.LineString:
+					# row['slope'] = slope(geo)
 			G_osm = graph_construct(osm_gdf)
 			blocks_gdfs[block_num]['osm_graph'] = G_osm
 			connected_components = len(list(nx.connected_components(G_osm)))
 			visualize(osm_gdf, title=str(block_num) + " cc = " + str(connected_components))
 
-			# Create SDOT_graph
-			# First add intersection nodes of linestrings
-			sdot_gdf = blocks_gdfs[block_num]['sdot_gdf']
 
+			# Create SDOT Graph
+			# First add intersection nodes of linestrings
 			lines = shapely.ops.unary_union(sdot_gdf["geometry"])
 			if type(lines) == shapely.geometry.MultiLineString:
 				lines = explodeMultiLineStrings(lines)
+			elif type(lines) == shapely.geometry.LineString:
+				lines = [lines]
 			else:
 				print("THIS HAPPENED!")
-
-
-
-			# for line_1 in sdot_gdf["geometry"]:
-			# 	line_unions = line2
-			# 	for line_2 in sdot_gdf["geometry"]:
-			# 		if line_1 != line_2:
-			# 			intersection = line_union.intersection(line_2)
-			# 			line_unions = line_union.union(line_2)
-
-			# 			if type(intersection) == shapely.geometry.Point:
-			# 				line_union = line_union.union(intersection)
-			# 				print(line_union)
-			# 				line_points = []
-			# 				line_points.append(line_1.coords[0])
-			# 				line_points.append(intersection.coords[0])
-			# 				line_points.append(line_1.coords[1])
-			# 				#print(line_points)
-			# 				# update line_union with new line
-			# 				shapely.geometry.LineString(line_points)
-			# 				line_union = shapely.geometry.LineString(line_points)
-			# 				#print(line_union)
-			# 	# keep line or add new line
-			# 	lines.append(line_union)
-
 			sdot_gdf = gpd.GeoDataFrame(geometry=lines)
-
 			G_sdot = graph_construct(sdot_gdf)
 			blocks_gdfs[block_num]['sdot_graph'] = G_sdot
 			connected_components = len(list(nx.connected_components(G_sdot)))
 			visualize(sdot_gdf, title=str(block_num) + " cc = " + str(connected_components))
 
-			# Then Create graphph
 
-	
-	# TODO: find graph conectedness. look at Nick's Graph creation method
+			# Create Access Map Graph
+			G_am = graph_construct(am_gdf)
+			blocks_gdfs[block_num]['am_graph'] = G_am
+			connected_components = len(list(nx.connected_components(G_am)))
+			#visualize(am_gdf, title=str(block_num) + " cc = " + str(connected_components))
+
+
+	# TODO: calculate one to one comparison with slope and start and end point
+	# TODO: calculate overalp with roads and buildings
+
+# line matching between datasets
+# slope within threshold
+# length within threshold
+# end points within threshold
+LEN_THRESH = 0.3
+
+def compare_lengths(row1, row2):
+	line1 = row1[1]['geometry']
+	line2 = row2[1]['geometry']
+	if line1.length < line2.length:
+		return line1.length / line2.length > LEN_THRESH
+	else:
+		return line2.length / line1.length > LEN_THRESH
+
+END_DIST = 20
+
+def compare_ends(row1, row2):
+	line1_coords = row1[1]['geometry'].coords
+	one_start = shapely.geometry.Point(line1_coords[0])
+	one_end = shapely.geometry.Point(line1_coords[len(line1_coords) - 1])
+
+	line2_coords = row2[1]['geometry'].coords
+	two_start = shapely.geometry.Point(line2_coords[0])
+	two_end = shapely.geometry.Point(line2_coords[len(line2_coords) - 1])
+	if one_start.distance(two_start) < END_DIST or one_start.distance(two_end) < END_DIST:
+		return True
+	elif one_end.distance(two_start) < END_DIST or one_end.distance(two_end) < END_DIST:
+		return True
+	else:
+		return False
+
+def compare_slopes(row1, row2):
+	slope1 = row1[1]['slope']
+	slope2 = row2[1]['slope']
+	if abs(slope1) > 5 and abs(slope2) > 5:
+		return True
+	else:
+		return abs(row1[1]['slope'] - row2[1]['slope']) < .1
+
+# account for lines being reversed too. left to right slopes.
+def slope(line):
+	slope = None
+	end_one = line.coords[0]
+	end_two = line.coords[len(line.coords) - 1]
+	if end_one[0] == end_two[0]:
+		return None
+	elif end_one[0] < end_two[0]:
+		return (end_two[1] - end_one[1]) / (end_two[0] - end_one[0])
+	else:
+		return (end_one[1] - end_two[1]) / (end_one[0] - end_two[0])
+
 
 def graph_construct(gdf):
 	G = nx.Graph()
