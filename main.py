@@ -29,11 +29,10 @@ LEN_CHECK_THRESH = 8 # any segment less than this length is stripped out of matc
 END_DIST = 12 # segments need at least one end point within this distance of each other
 SLOPE_DIFFERENCE = 0.5 # allowed difference for a match when absolute value of one slope is less than 5
 HIGH_SLOPE_CUTOFF = 5 # slopes higher than this are assumed to be the same
+SWK_BUFFER = 0.4572 # this is in meters (1.5 feet) this extends sidewalks to 3 foot width
 
 def main():
 	click.echo("Loading Data")
-	regenerate = False
-	# regenerate = True
 
 	streets = gpd.read_file('./data/sdot/streets.shp').to_crs(crs_utm)
 
@@ -45,170 +44,230 @@ def main():
 	mask = neighborhoods['S_HOOD'] == neighborhood_name
 	udistrict = neighborhoods.loc[mask, 'geometry'].iloc[0]
 
-	# OSM PREP
+	# STREET POLYGON FOR CHECKING SWK OVERLAP
+	streets_poly_gdf = gpd.read_file('./data/seattle_street_polygon.shp').to_crs(crs_utm)
+	streets_poly_gdf = clip_data(streets_poly_gdf, udistrict)
+
+	# OPEN STREET MAP DATA PREP
 	click.echo("Preparing OSM Data")
-	osm_gdf = json_to_gdf("./data/osm/udistrict_sidewalks.geojson")
+	osm_gdf = json_to_gdf("./data/osm/udistrict.geojson")
+	osm_gdf = osm_gdf.loc[osm_gdf['geometry'].geom_type == 'LineString']
 	osm_gdf_copy = osm_gdf.copy()
-	# plot_buffer(osm_gdf, udistrict)
 
-	if regenerate:
+	# SDOT PREP
+	click.echo("Preparing SDOT Data")
+	sdot_json = open("./data/sdot/SDOT_swk.json").read()
+	sdot_json = json.loads(sdot_json)
+	sdot_data = sdot_json['data']
+	sdot_geo = convert_to_geo(sdot_data)
+	sdot_gdf = gpd.GeoDataFrame.from_features(sdot_geo['features'])
+	sdot_gdf.crs = crs_merc
+	sdot_gdf = sdot_gdf.to_crs(crs_utm)
+	sdot_gdf = clip_data(sdot_gdf, udistrict)
 
-		# SDOT PREP
-		click.echo("Preparing SDOT Data")
-		sdot_json = open("./data/sdot/SDOT_swk.json").read()
-		sdot_json = json.loads(sdot_json)
-		sdot_data = sdot_json['data']
-		sdot_geo = convert_to_geo(sdot_data)
-		sdot_gdf = gpd.GeoDataFrame.from_features(sdot_geo['features'])
-		sdot_gdf.crs = crs_merc
-		sdot_gdf = sdot_gdf.to_crs(crs_utm)
-		sdot_gdf = clip_data(sdot_gdf, udistrict)
+	# ACCESS MAP PREP
+	click.echo("Preparing Access Map Data")
+	am_gdf = json_to_gdf("./data/access_map/sidewalks.geojson")
+	am_gdf = clip_data(am_gdf, udistrict)
 
-		# ACCESS MAP PREP
-		click.echo("Preparing Access Map Data")
-		am_gdf = json_to_gdf("./data/access_map/sidewalks.geojson")
-		am_gdf = clip_data(am_gdf, udistrict)
+	# To Avoid Data Prep
+	# am_gdf.to_file("./data/am_gdf.shp")
+	# sdot_gdf.to_file("./data/sdot_gdf.shp")
+	# osm_gdf.to_file("./data/osm_gdf.shp")
 
-		# SPLIT BLOCKS
-		click.echo("Polyganizing Blocks")
-		blocks = blocks_subtasks(streets)
-		blocks = filter_blocks_by_poly(blocks, udistrict)
-		# visualize(blocks)
+	# SPLIT BLOCKS
+	click.echo("Polyganizing Blocks")
+	blocks = blocks_subtasks(streets)
+	blocks = filter_blocks_by_poly(blocks, udistrict)
 
-		layers = {
-			'osm_gdf': osm_gdf,
-			'am_gdf': am_gdf,
-			'sdot_gdf': sdot_gdf
-		}
+	layers = {
+		'osm_gdf': osm_gdf,
+		'am_gdf': am_gdf,
+		'sdot_gdf': sdot_gdf
+	}
 
-		# mappings between datasets
-		osm_to_other = []
-		sdot_no_matches = []
-		am_no_matches = []
+	# mappings between datasets
+	osm_to_other = []
+	sdot_no_matches = []
+	am_no_matches = []
 
-		# PROCESS DATA BLOCK BY BLOCK
-		blocks_gdfs = split_geometry_into_tasks(layers, blocks)
-		for block_num in blocks_gdfs:
-			osm_gdf = blocks_gdfs[block_num]['osm_gdf']
-			if len(osm_gdf) > 0: # only examine blocks that have osm data
+	# PROCESS DATA BLOCK BY BLOCK
+	blocks_gdfs = split_geometry_into_tasks(layers, blocks)
 
-				osm_gdf_filtered = osm_gdf.loc[osm_gdf['geometry'].length > LEN_CHECK_THRESH]
-				osm_gdf_filtered['slope'] = osm_gdf_filtered['geometry'].apply(slope)
-				sdot_gdf = blocks_gdfs[block_num]['sdot_gdf']
-				sdot_gdf['slope'] = sdot_gdf['geometry'].apply(slope)
-				am_gdf = blocks_gdfs[block_num]['am_gdf']
-				am_gdf['slope'] = am_gdf['geometry'].apply(slope)
-				visualize(osm_gdf_filtered, title=str(block_num), extras=[sdot_gdf])
+	for block_num in blocks_gdfs:
+		osm_gdf = blocks_gdfs[block_num]['osm_gdf']
+		if len(osm_gdf) > 0: # only examine blocks that have osm data
+			click.echo("preparing block number: " + str(block_num))
 
-				# FINDING MAPPINGS TO OSM DATA
-				for osm_row in osm_gdf_filtered.iterrows():
-					if type(osm_row[1]['geometry']) == shapely.geometry.LineString:
-
-						sdot_matches = []
-						for sdot_row in sdot_gdf.iterrows():
-							if is_match(osm_row, sdot_row):
-								sdot_matches.append(sdot_row[1]['geometry'])
-
-						am_matches = []
-						for am_row in am_gdf.iterrows():
-							if is_match(osm_row, am_row):
-								am_matches.append(am_row[1]['geometry'])		
-
-						data = {
-							'osm_line': osm_row[1]['geometry'],
-							'sdot_matches': sdot_matches,
-							'am_matches': am_matches
-						}
-
-						osm_to_other.append(data)
-
-						# VISUALIZE MAPPINGS
-						target_gdf = gpd.GeoDataFrame(geometry=[osm_row[1]['geometry']])
-						am_matches_gdf = gpd.GeoDataFrame(geometry=am_matches)
-						sdot_matches_gdf = gpd.GeoDataFrame(geometry=sdot_matches)
-
-						if len(sdot_matches) > 0:
-							visualize(target_gdf, buff=blocks_gdfs[block_num]['polygon'], title="Matches Found: " + str(len(sdot_matches)), extras=[sdot_matches_gdf])
-						else:
-							visualize(target_gdf, buff=blocks_gdfs[block_num]['polygon'], title="Matches Found: " + str(len(sdot_matches)), extras=[sdot_gdf])
-
-						# if len(am_matches) > 0:
-						# 	visualize(target_gdf, buff=blocks_gdfs[block_num]['polygon'], title="Matches Found: " + str(len(am_matches)), extras=[am_matches_gdf])
-						# else:
-						# 	visualize(target_gdf, buff=blocks_gdfs[block_num]['polygon'], title="Matches Found: " + str(len(am_matches)), extras=[am_gdf])
-
-				# FINDING SDOT WITHOUT MAPPING
-				for sdot_row in sdot_gdf.iterrows():
-					match = False
-					for osm_row in osm_gdf_filtered.iterrows():
-						if type(osm_row[1]['geometry']) == shapely.geometry.LineString and is_match(osm_row, sdot_row):
-							match = True
-							break
-					if not match:
-						sdot_no_matches.append(sdot_row[1]['geometry'])
-
-				# FINDING AM WITHOUT MAPPING
-				for am_row in am_gdf.iterrows():
-					match = False
-					for osm_row in osm_gdf_filtered.iterrows():
-						if type(osm_row[1]['geometry']) == shapely.geometry.LineString and is_match(osm_row, am_row):
-							match = True
-							break
-					if not match: # we have no corresponding ground truth sidewalk
-						am_no_matches.append(am_row[1]['geometry'])
-
-				# COMPARING GRAPH CONNECTIVITY
-				G_osm = graph_construct(osm_gdf)
-				blocks_gdfs[block_num]['osm_graph'] = G_osm
-				connected_components = len(list(nx.connected_components(G_osm)))
-				#visualize(osm_gdf, title=str(block_num) + " cc = " + str(connected_components))
-
-				# Create SDOT Graph
-				# First must add intersection nodes of linestrings in sdot data to simulate connectivity
-				lines = shapely.ops.unary_union(sdot_gdf["geometry"])
-				if type(lines) == shapely.geometry.MultiLineString:
-					lines = explodeMultiLineStrings(lines)
-				elif type(lines) == shapely.geometry.LineString:
-					lines = [lines]
-				else:
-					print("THIS HAPPENED!")
-				sdot_gdf = gpd.GeoDataFrame(geometry=lines)
-				G_sdot = graph_construct(sdot_gdf)
-				blocks_gdfs[block_num]['sdot_graph'] = G_sdot
-				connected_components = len(list(nx.connected_components(G_sdot)))
-				#visualize(sdot_gdf, title=str(block_num) + " cc = " + str(connected_components))
-
-				# Create Access Map Graph
-				G_am = graph_construct(am_gdf)
-				blocks_gdfs[block_num]['am_graph'] = G_am
-				connected_components = len(list(nx.connected_components(G_am)))
-				#visualize(am_gdf, title=str(block_num) + " cc = " + str(connected_components))
-
-		osm_to_other_df = pd.DataFrame(osm_to_other)
-		print(osm_to_other_df.head())
-		sdot_no_matches = gpd.GeoDataFrame(geometry=sdot_no_matches)
-		am_no_matches 	= gpd.GeoDataFrame(geometry=am_no_matches)
-		print(str(len(sdot_no_matches)) + " " + str(len(am_no_matches)))
-		visualize(osm_gdf_copy, buff=udistrict, title="No Matches for SDOT", extras=[sdot_no_matches])
-		visualize(osm_gdf_copy, buff=udistrict, title="No Matches for AM", extras=[am_no_matches])
-		sdot_no_matches.to_file('./data/generated/sdot_no_matches.shp')
-		am_no_matches.to_file('./data/generated/am_no_matches.shp')
-	else:
-		sdot_no_matches = gpd.read_file('./data/generated/sdot_no_matches.shp')
-		am_no_matches =  gpd.read_file('./data/generated/am_no_matches.shp')
-		visualize(osm_gdf_copy, buff=udistrict, title="No Matches for SDOT", extras=[sdot_no_matches])
-		visualize(osm_gdf_copy, buff=udistrict, title="No Matches for AM", extras=[am_no_matches])
+			# EXTRACTING DATA FOR CURRENT BLOCK
+			osm_gdf_filtered = osm_gdf.loc[osm_gdf['geometry'].length > LEN_CHECK_THRESH]
+			sdot_gdf = blocks_gdfs[block_num]['sdot_gdf']
+			am_gdf = blocks_gdfs[block_num]['am_gdf']
 
 
-	# TODO: calculate one to one comparison with slope and start and end point
-	# TODO: calculate overalp with roads and buildings
+			# FIND STREET SIDEWALK OVERLAP BY BLOCK
+			curr_block = blocks_gdfs[block_num]['polygon']
+			streets_poly_gdf_copy = streets_poly_gdf.copy()
+			overlap_results = overlap_computations(osm_gdf_filtered, sdot_gdf, am_gdf, curr_block, streets_poly_gdf)
+			blocks_gdfs[block_num]['overlap_results'] = overlap_results
+			
 
+			# IN PROGRESS: FINDING MAPPINGS BETWEEN DATASETS
+			# precalculate slope of lines for one to one.
+			am_gdf['slope'] = am_gdf['geometry'].apply(slope)
+			osm_gdf_filtered['slope'] = osm_gdf_filtered['geometry'].apply(slope)
+			sdot_gdf['slope'] = sdot_gdf['geometry'].apply(slope)
+
+			# FINDING MAPINGS TO OSM
+			for osm_row in osm_gdf_filtered.iterrows():
+				if type(osm_row[1]['geometry']) == shapely.geometry.LineString:
+					osm_to_other.append(find_matches(osm_row, sdot_gdf, am_gdf, curr_block))
+
+			# FINDING SDOT WITHOUT MAPPING
+			for sdot_row in sdot_gdf.iterrows():
+				if not is_osm_match(sdot_row, osm_gdf_filtered):
+					sdot_no_matches.append(sdot_row[1]['geometry'])
+
+			# FINDING AM WITHOUT MAPPING
+			for am_row in am_gdf.iterrows():
+				if not is_osm_match(am_row, osm_gdf_filtered): # we have no corresponding ground truth sidewalk
+					am_no_matches.append(am_row[1]['geometry'])
+
+			graph_results = graph_computations(osm_gdf, osm_gdf_filtered, sdot_gdf, am_gdf)
+			blocks_gdfs[block_num]['graph_results'] = graph_results
+
+	# FOR VISUALIZING DATA MAPPINGS
+	# osm_to_other_df = pd.DataFrame(osm_to_other)
+	# print(osm_to_other_df.head())
+	# sdot_no_matches = gpd.GeoDataFrame(geometry=sdot_no_matches)
+	# am_no_matches 	= gpd.GeoDataFrame(geometry=am_no_matches)
+	# print(str(len(sdot_no_matches)) + " " + str(len(am_no_matches)))
+	# visualize(osm_gdf_copy, buff=udistrict, title="No Matches for SDOT", extras=[sdot_no_matches])
+	# visualize(osm_gdf_copy, buff=udistrict, title="No Matches for AM", extras=[am_no_matches])
+	# sdot_no_matches.to_file('./data/generated/sdot_no_matches.shp')
+	# am_no_matches.to_file('./data/generated/am_no_matches.shp')
+	# sdot_no_matches = gpd.read_file('./data/generated/sdot_no_matches.shp')
+	# am_no_matches =  gpd.read_file('./data/generated/am_no_matches.shp')
+	# visualize(osm_gdf_copy, buff=udistrict, title="No Matches for SDOT", extras=[sdot_no_matches])
+	# visualize(osm_gdf_copy, buff=udistrict, title="No Matches for AM", extras=[am_no_matches])
+
+	click.echo('PREPARING OUTPUT CSV')
+	output_to_csv(blocks_gdfs, "./data/output.csv")
+
+# creates a series from the given data with indexes i
+def s(data, i):
+	return pd.Series(data, index=i)
+
+# for the given three datasets, computes overlap with streets, overlap with 'ground truth' when given buffer of SWK_BUFFER, and overall SWK area when buffered.
+def overlap_computations(osm_gdf_filtered, sdot_gdf, am_gdf, curr_block, streets_poly_gdf_copy):
+	streets_poly_gdf_copy = streets_poly_gdf_copy.loc[streets_poly_gdf_copy.intersects(curr_block)]
+	streets_poly_gdf_copy['geometry'] = streets_poly_gdf_copy.intersection(curr_block)
+
+	# OVERLAP WITH STREETS
+	osm_overlap  = calculate_overlap(osm_gdf_filtered, streets_poly_gdf_copy)
+	sdot_overlap = calculate_overlap(sdot_gdf, streets_poly_gdf_copy)
+	am_overlap   = calculate_overlap(am_gdf, streets_poly_gdf_copy)
+
+	# OVERLAP WITH "GOUND TRUTH" OSM SWKS
+	sdot_ground_overlap = calculate_swk_overlap(sdot_gdf, osm_gdf_filtered)
+	am_ground_overlap = calculate_swk_overlap(am_gdf, osm_gdf_filtered)
+	osm_ground_overlap = sanity_check(osm_gdf_filtered)
+
+	results = {}
+	results['osm_ground_overlap'] = sum(osm_ground_overlap.area) if len(osm_ground_overlap) > 0 else 0
+	results['sdot_ground_overlap'] = sum(sdot_ground_overlap.area) if len(sdot_ground_overlap) > 0 else 0
+	results['am_ground_overlap'] = sum(am_ground_overlap.area) if len(am_ground_overlap) > 0 else 0
+
+	results['osm_overlap'] = sum(osm_overlap.area) if len(osm_overlap) > 0 else 0
+	results['sdot_overlap'] = sum(sdot_overlap.area) if len(sdot_overlap) > 0 else 0
+	results['am_overlap'] = sum(am_overlap.area) if len(am_overlap) > 0 else 0\
+
+	results['osm_swk_area'] = calculate_sidewalk_area(osm_gdf_filtered)
+	results['sdot_swk_area'] = calculate_sidewalk_area(sdot_gdf)
+	results['am_swk_area'] = calculate_sidewalk_area(am_gdf)
+	return results
+
+# calculates overlap betweeen given gdf and street polygon when the given gdf is buffered by SWK_BUFFER
+def calculate_overlap(gdf, streets_poly):
+	sidewalks = gdf.geometry.apply(lambda g: g.buffer(SWK_BUFFER, cap_style=2))
+	sidewalks = gpd.GeoDataFrame(geometry=sidewalks)
+	overalp = gpd.overlay(sidewalks, streets_poly, how="intersection")
+	return overalp
+
+# returns overlap of given geodataframe and given "ground" source when each dataset is buffered by SWK_BUFFER
+def calculate_swk_overlap(gdf, ground):
+	sidewalks = gdf.geometry.apply(lambda g: g.buffer(SWK_BUFFER, cap_style=2))
+	sidewalks = gpd.GeoDataFrame(geometry=sidewalks)
+	ground = ground.geometry.apply(lambda g: g.buffer(SWK_BUFFER, cap_style=2))
+	ground = gpd.GeoDataFrame(geometry=ground)
+	overlap = gpd.overlay(sidewalks, ground, how="intersection")
+	return overlap
+
+# produces overlap with itself
+def sanity_check(ground):
+	ground = ground.geometry.apply(lambda g: g.buffer(SWK_BUFFER, cap_style=2))
+	ground = gpd.GeoDataFrame(geometry=ground)
+	overlap = gpd.overlay(ground, ground, how="intersection")
+	return overlap
+
+# sums area of gdf with each segment getting a buffer of SWK_BUFFER
+def calculate_sidewalk_area(gdf):
+	sidewalks = gdf.geometry.apply(lambda g: g.buffer(SWK_BUFFER, cap_style=2))
+	sidewalks = gpd.GeoDataFrame(geometry=sidewalks)
+	return sum(sidewalks.area)
+
+# for a given osm_row (line), returns matches in sdot and access map data for that block
+def find_matches(osm_row, sdot_gdf, am_gdf, curr_block):
+	sdot_matches = []
+	for sdot_row in sdot_gdf.iterrows():
+		if is_match(osm_row, sdot_row):
+			sdot_matches.append(sdot_row[1]['geometry'])
+
+	am_matches = []
+	for am_row in am_gdf.iterrows():
+		if is_match(osm_row, am_row):
+			am_matches.append(am_row[1]['geometry'])		
+
+	data = {
+		'osm_line': osm_row[1]['geometry'],
+		'sdot_matches': sdot_matches,
+		'am_matches': am_matches
+	}
+
+	# VISUALIZE MAPPINGS
+	# target_gdf = gpd.GeoDataFrame(geometry=[osm_row[1]['geometry']])
+	# am_matches_gdf = gpd.GeoDataFrame(geometry=am_matches)
+	# sdot_matches_gdf = gpd.GeoDataFrame(geometry=sdot_matches)
+
+	# if len(sdot_matches) > 0:
+	# 	visualize(target_gdf, buff=curr_block, title="Matches Found: " + str(len(sdot_matches)), extras=[sdot_matches_gdf])
+	# else:
+	# 	visualize(target_gdf, buff=curr_block, title="Matches Found: " + str(len(sdot_matches)), extras=[sdot_gdf])
+
+	# if len(am_matches) > 0:
+	# 	visualize(target_gdf, buff=curr_block, title="Matches Found: " + str(len(am_matches)), extras=[am_matches_gdf])
+	# else:
+	# 	visualize(target_gdf, buff=curr_block, title="Matches Found: " + str(len(am_matches)), extras=[am_gdf])
+
+	return data
+
+# returns true if given row has a match to osm data for that block
+def is_osm_match(row, osm_gdf_filtered):
+	match = False
+	for osm_row in osm_gdf_filtered.iterrows():
+		if type(osm_row[1]['geometry']) == shapely.geometry.LineString and is_match(osm_row, row):
+			match = True
+			break
+	return match
+
+# returns true if lines are matches
 def is_match(row1, row2):
 	close_end = compare_ends(row1, row2)
 	close_slope = compare_slopes(row1, row2)
 	close_length = compare_lengths(row1, row2)
 	return close_end and close_slope and close_length
 
+# returns true if length ratio between segments is greater then LEN_COMP_THRESH
 def compare_lengths(row1, row2):
 	line1 = row1[1]['geometry']
 	line2 = row2[1]['geometry']
@@ -217,8 +276,7 @@ def compare_lengths(row1, row2):
 	else:
 		return line2.length / line1.length > LEN_COMP_THRESH
 
-
-# returns 0, 1, or 2 depending on number of matches the end points have.
+# returns true if the lines have an end point match and other end points are within min length of each other
 def compare_ends(row1, row2):
 	length_min = min(row1[1]['geometry'].length, row2[1]['geometry'].length)
 
@@ -246,7 +304,9 @@ def compare_ends(row1, row2):
 	d = compare_points(one_end, two_end, one_start, two_start)
 	return a or b or c or d
 
-
+# compares slope of two lines
+# returns true if both lines have slope greater than HIGH_SLOPE_CUTOFF
+# or if difference in slope is less than SLOPE_DIFFERENCE
 def compare_slopes(row1, row2):
 	slope1 = row1[1]['slope']
 	slope2 = row2[1]['slope']
@@ -267,7 +327,51 @@ def slope(line):
 	else:
 		return (end_one[1] - end_two[1]) / (end_one[0] - end_two[0])
 
+# completes graph computations for the given datasets
+# computes conected components length of sidewalks and number of segments
+def graph_computations(osm_gdf, osm_gdf_filtered, sdot_gdf, am_gdf):
+	results = {}
 
+	# COMPARING GRAPH CONNECTIVITY
+	# keep links for graph creation, so use non filtered osm_gdf
+	G_osm = graph_construct(osm_gdf)
+	results['osm_graph_cc'] = len(list(nx.connected_components(G_osm)))
+	# use filtered dataset for seg num and len calculation
+	results['osm_swk_len'] = sum(osm_gdf_filtered.length)
+	results['osm_swk_seg_num'] = len(osm_gdf_filtered)
+	# connected_components = len(list(nx.connected_components(G_osm)))
+	#visualize(osm_gdf, title=str(block_num) + " cc = " + str(connected_components))
+
+	# CREATE SDOT GRAPH
+	# Unary Union Creates Points at Intersection of SDOT Lines
+	lines = shapely.ops.unary_union(sdot_gdf["geometry"])
+	# convert unaryunion result to only linestrings
+	if type(lines) == shapely.geometry.MultiLineString:
+		lines = explodeMultiLineStrings(lines)
+	elif type(lines) == shapely.geometry.LineString:
+		lines = [lines]
+	else:
+		raise ValueError("unary_union returned non line string data")
+
+	sdot_gdf = gpd.GeoDataFrame(geometry=lines)
+	G_sdot = graph_construct(sdot_gdf)
+	results['sdot_graph_cc'] = len(list(nx.connected_components(G_sdot)))
+	results['sdot_swk_len'] = sum(sdot_gdf.length)
+	results['sdot_swk_seg_num'] = len(sdot_gdf)
+	# connected_components = len(list(nx.connected_components(G_sdot)))
+	#visualize(sdot_gdf, title=str(block_num) + " cc = " + str(connected_components))
+
+	# CREATE ACCESS MAP GRAPH
+	G_am = graph_construct(am_gdf)
+	results['am_graph_cc'] = len(list(nx.connected_components(G_am)))
+	results['am_swk_len'] = sum(am_gdf.length)
+	results['am_swk_seg_num'] = len(am_gdf)
+	# connected_components = len(list(nx.connected_components(G_am)))
+	#visualize(am_gdf, title=str(block_num) + " cc = " + str(connected_components))
+
+	return results
+
+# creates a graph from the linestring data in the given geodataframe
 def graph_construct(gdf):
 	G = nx.Graph()
 	for line in gdf['geometry']:
@@ -331,6 +435,7 @@ def blocks_subtasks(streets):
 
     return blocks
 
+# this function isn't used
 def blocks_poly_boundary_subtasks(streets, polygon):
     boundary = polygon.boundary
     geoms = list(streets.geometry)
@@ -370,6 +475,7 @@ def filter_blocks_by_poly(blocks, polygon):
 
     return new_blocks
 
+# this function isn't used
 def isolate_osm_sidewalks(streets):
 	osm_gdf = json_to_gdf("./data/osm/roads.geojson")
 	footway = osm_gdf.loc[osm_gdf["type"] == "footway"]
@@ -393,7 +499,7 @@ def isolate_osm_sidewalks(streets):
 	all_intersection = gpd.GeoDataFrame(geometry=geoms)
 	all_intersection.to_file('./data/osm/sidewalks.shp')
 
-
+# converts json file to geodataframe
 def json_to_gdf(file_path):
 	json_data = open(file_path).read()
 	json_data = json.loads(json_data)
@@ -410,6 +516,8 @@ def plot_buffer(data, buffa):
 	cliped_data = clip_data(data, buffa)
 	visualize(cliped_data, buff=buffa)
 
+# for visualizing geodataframes
+# you can pass a buffer, title, and extra geodataframes to visualize
 def visualize(data, buff=None, title=None, extras=[]):
 	#plt.ion()
 	plot_ref = None
@@ -466,70 +574,90 @@ def convert_to_geo(data):
 	geo_j["features"] = features
 	return geo_j
 
-	# extra code from attempting to parse osm.xml
+# converts block_gdfs datastructure to a data frame then outputs to given file path
+# this is very ugly, but works
+def output_to_csv(blocks_gdfs, file_path):
+	i = [] # block numbers for dataframe creation
+	osm_cc = []
+	osm_swk_len = []
+	osm_swk_seg_num = []
+	osm_overlap = []
+	osm_swk_area = []
+	osm_ground_overlap = []
 
-	# city = ox.gdf_from_place('Seattle, WA')
-	# ud = ox.gdf_from_place('University District, Seattle, WA')
-	# data = ud.loc[0]
-	# print(data)
-	# G = ox.graph_from_bbox(data["bbox_north"], data["bbox_south"], data["bbox_east"], data["bbox_west"], network_type='walk')
+	sdot_cc = []
+	sdot_swk_len = []
+	sdot_swk_seg_num = []
+	sdot_overlap = []
+	sdot_swk_area = []
+	sdot_ground_overlap = []
 
-	# print(type(G))
-	# #G_projected = ox.project_graph(G)
-	# #print(type(G_projected))
+	am_cc = []
+	am_swk_len = []
+	am_swk_seg_num = []
+	am_overlap = []
+	am_swk_area = []
+	am_ground_overlap = []
 
-	# for n,nbrsdict in G.adjacency_iter():
-	# 	for nbr,keydict in nbrsdict.items():
-	# 		for key,eattr in keydict.items():
-	# 			print(eattr)
-	# #ox.plot_graph(G_projected)
+	for block_num in blocks_gdfs:
+		osm_gdf = blocks_gdfs[block_num]['osm_gdf']
+		if len(osm_gdf) > 0:
+			block = blocks_gdfs[block_num]
+			graph_results = block['graph_results']
+			overlap_results = block['overlap_results']
 
-	# click.echo("OSM Load Complete")
-	#G = ox.graph_from_polygon(mission_shape, network_type='drive')
-	#ox.plot_graph(G)
+			i.append(block_num)
 
-	# load access map
-	# load SDOT data
-	# Get the streets shapefile
+			osm_cc.append(graph_results['osm_graph_cc'])
+			osm_swk_len.append(graph_results['osm_swk_len'])
+			osm_swk_seg_num.append(graph_results['osm_swk_seg_num'])
+			osm_overlap.append(overlap_results['osm_overlap'])
+			osm_swk_area.append(overlap_results['osm_swk_area'])
+			osm_ground_overlap.append(overlap_results['osm_ground_overlap'])
 
+			sdot_cc.append(graph_results['sdot_graph_cc'])
+			sdot_swk_len.append(graph_results['sdot_swk_len'])
+			sdot_swk_seg_num.append(graph_results['sdot_swk_seg_num'])
+			sdot_overlap.append(overlap_results['sdot_overlap'])
+			sdot_swk_area.append(overlap_results['sdot_swk_area'])
+			sdot_ground_overlap.append(overlap_results['sdot_ground_overlap'])
 
+			am_cc.append(graph_results['am_graph_cc'])
+			am_swk_len.append(graph_results['am_swk_len'])
+			am_swk_seg_num.append(graph_results['am_swk_seg_num'])
+			am_overlap.append(overlap_results['am_overlap'])
+			am_swk_area.append(overlap_results['am_swk_area'])
+			am_ground_overlap.append(overlap_results['am_ground_overlap'])
 
-	# oms_xml = xml.etree.ElementTree.parse('./data/osm/seattle.osm').getroot()
+	d = {
+		'block_num': s(i, i),
+		'osm_cc': s(osm_cc, i),
+		'osm_swk_len': s(osm_swk_len, i),
+		'osm_swk_seg_num': s(osm_swk_seg_num, i),
+		'osm_overlap': s(osm_overlap, i),
+		'osm_swk_area': s(osm_swk_area, i),
+		'osm_ground_overlap': s(osm_ground_overlap, i),
 
-	# print("we got the xml")
+		'sdot_cc': s(sdot_cc, i),
+		'sdot_swk_len': s(sdot_swk_len, i),
+		'sdot_swk_seg_num': s(sdot_swk_seg_num, i),
+		'sdot_overlap': s(sdot_overlap, i),
+		'sdot_swk_area': s(sdot_swk_area, i),
+		'sdot_ground_overlap': s(sdot_ground_overlap, i),
 
+		'am_cc': s(am_cc, i),
+		'am_swk_len': s(am_swk_len, i),
+		'am_swk_seg_num': s(am_swk_seg_num, i),
+		'am_overlap': s(am_overlap, i),
+		'am_swk_area': s(am_swk_area, i),
+		'am_ground_overlap': s(am_ground_overlap, i),
+	}
 
-	# for way in oms_xml.findall('way'):
-	# 	print(type(way))
-	# 	for tag in way.iter('tag'):
-	# 		key = tag.get('k')
-	# 		value = tag.get('v')
-	# 		if value == "sidewalk":
-	# 			wayjson=way.ExportToJson(as_object=True)
-	# 			print(wayjson)
-	# 			print("WE FOUND ONE")
+	df = pd.DataFrame(d)
 
-	# features = [x for x in layer]
-	# print(len(features))
+	print(df)
 
-	# data_list = []
-	# for feature in features:
-	#     data = feature.ExportToJson(as_object=True)
-	#     coords = data['geometry']['coordinates']
-	#     shapely_geo = Point(coords[0],coords[1])
-	#     name = data['properties']['name']
-	#     highway = data['properties']['highway']
-	#     other_tags = data['properties']['other_tags']
-	#     if other_tags and 'amenity' in other_tags:
-	#         feat = [x for x in other_tags.split(',') if 'amenity' in x][0]
-	#         amenity = feat[feat.rfind('>')+2:feat.rfind('"')]
-	#     else:
-	#         amenity = None
-	#     data_list.append([name,highway,amenity,shapely_geo])
-	# gdf = gpd.GeoDataFrame(data_list,columns=['Name','Highway','Amenity','geometry'],crs={'init': 'epsg:4326'}).to_crs(epsg=3310)
-
-	#print(intersection)
-
+	df.to_csv(file_path)
 
 if __name__ == "__main__":
 	main()
